@@ -1,72 +1,168 @@
 """
 审计相关 API 接口
+实现文件上传、审计启动和结果查询
 """
 
-from fastapi import APIRouter, UploadFile, File, HTTPException
-from pydantic import BaseModel
-from typing import Optional, List
+from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
+from pathlib import Path
+from typing import Optional, Dict
+from datetime import datetime
+import uuid
+
+from app.models.schemas import (
+    DocumentUploadResponse,
+    AuditStartRequest,
+    AuditResult,
+    TaskStatus,
+    ValidationViolation,
+    RiskSeverity
+)
+from app.services.storage import file_storage
+from app.core.config import settings
 
 router = APIRouter()
 
-
-class AuditStartRequest(BaseModel):
-    """审计启动请求"""
-    document_id: str
-    rules: Optional[List[str]] = None
+# 内存存储（MVP阶段，后续替换为数据库）
+documents_db: Dict[str, dict] = {}
+audits_db: Dict[str, AuditResult] = {}
 
 
-class AuditResult(BaseModel):
-    """审计结果"""
-    audit_id: str
-    status: str
-    risk_score: Optional[float] = None
-    violations: Optional[List[dict]] = None
-    reasoning_chain: Optional[List[str]] = None
+async def parse_document_async(document_id: str, file_path: Path):
+    """
+    后台异步解析文档任务
+    
+    使用 FastAPI BackgroundTasks 简化异步处理
+    """
+    try:
+        # 更新状态为处理中
+        if document_id in documents_db:
+            documents_db[document_id]["status"] = TaskStatus.PROCESSING
+        
+        # TODO: 集成 Docling 解析
+        # from app.services.document import document_parser
+        # parsed_data = await document_parser.parse(file_path)
+        
+        # 模拟解析完成
+        if document_id in documents_db:
+            documents_db[document_id]["status"] = TaskStatus.COMPLETED
+            documents_db[document_id]["file_path"] = str(file_path)
+            
+    except Exception as e:
+        if document_id in documents_db:
+            documents_db[document_id]["status"] = TaskStatus.FAILED
+            documents_db[document_id]["error"] = str(e)
 
 
-@router.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
+@router.post("/upload", response_model=DocumentUploadResponse)
+async def upload_document(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None
+):
     """
     上传财务报表文档
     
     支持 PDF 和 Excel 格式
+    使用 UUID + MD5 统一文件命名
+    后台异步解析文档
     """
-    # TODO: 实现文档上传和解析逻辑
+    # 验证文件名
     if not file.filename:
         raise HTTPException(status_code=400, detail="文件名不能为空")
     
-    allowed_extensions = {".pdf", ".xlsx", ".xls"}
-    file_ext = "." + file.filename.split(".")[-1].lower() if "." in file.filename else ""
-    
-    if file_ext not in allowed_extensions:
+    # 验证文件扩展名
+    if not file_storage.validate_extension(file.filename):
         raise HTTPException(
-            status_code=400, 
-            detail=f"不支持的文件格式，请上传 PDF 或 Excel 文件"
+            status_code=400,
+            detail=f"不支持的文件格式，仅支持: {', '.join(settings.ALLOWED_EXTENSIONS)}"
         )
     
-    return {
-        "document_id": "doc_placeholder",
+    # 验证文件大小（需要先读取）
+    content = await file.read()
+    if not file_storage.validate_size(len(content)):
+        raise HTTPException(
+            status_code=400,
+            detail=f"文件过大，最大允许 {settings.MAX_FILE_SIZE // 1024 // 1024}MB"
+        )
+    
+    # 重置文件指针
+    await file.seek(0)
+    
+    # 保存文件
+    try:
+        document_id, storage_path = await file_storage.save_upload(file)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"文件保存失败: {str(e)}")
+    
+    # 记录文档信息
+    documents_db[document_id] = {
+        "document_id": document_id,
         "filename": file.filename,
-        "status": "uploaded",
-        "message": "文档上传成功，等待解析"
+        "status": TaskStatus.PENDING,
+        "file_path": str(storage_path),
+        "created_at": datetime.now()
     }
+    
+    # 添加后台解析任务
+    if background_tasks:
+        background_tasks.add_task(parse_document_async, document_id, storage_path)
+    
+    return DocumentUploadResponse(
+        document_id=document_id,
+        filename=file.filename,
+        status=TaskStatus.PENDING,
+        message="文档上传成功，正在后台解析"
+    )
+
+
+@router.get("/document/{document_id}")
+async def get_document_status(document_id: str):
+    """
+    获取文档解析状态
+    """
+    if document_id not in documents_db:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    
+    return documents_db[document_id]
 
 
 @router.post("/start", response_model=AuditResult)
-async def start_audit(request: AuditStartRequest):
+async def start_audit(
+    request: AuditStartRequest,
+    background_tasks: BackgroundTasks = None
+):
     """
     启动审计流程
     
     触发神经-符号双引擎协同审计
     """
-    # TODO: 实现 LangGraph 审计流程编排
-    return AuditResult(
-        audit_id="audit_placeholder",
-        status="processing",
-        risk_score=None,
-        violations=None,
-        reasoning_chain=None
+    # 验证文档是否存在
+    if request.document_id not in documents_db:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    
+    doc = documents_db[request.document_id]
+    
+    # 验证文档是否已解析完成
+    if doc["status"] != TaskStatus.COMPLETED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"文档尚未解析完成，当前状态: {doc['status']}"
+        )
+    
+    # 创建审计任务
+    audit_id = str(uuid.uuid4())
+    audit_result = AuditResult(
+        audit_id=audit_id,
+        document_id=request.document_id,
+        status=TaskStatus.PROCESSING,
+        risk_score=None
     )
+    
+    audits_db[audit_id] = audit_result
+    
+    # TODO: 添加后台审计任务
+    # background_tasks.add_task(run_audit_async, audit_id, request.document_id)
+    
+    return audit_result
 
 
 @router.get("/result/{audit_id}", response_model=AuditResult)
@@ -76,22 +172,51 @@ async def get_audit_result(audit_id: str):
     
     返回完整的审计报告，包括风险评分和推理链
     """
-    # TODO: 从数据库获取审计结果
-    return AuditResult(
-        audit_id=audit_id,
-        status="completed",
-        risk_score=72.0,
-        violations=[
-            {
-                "rule_id": "R001",
-                "severity": "WARNING",
-                "description": "应收账款周转率异常偏低",
-                "suggestion": "建议核查应收账款账龄分布"
-            }
-        ],
-        reasoning_chain=[
-            "步骤 1: 从资产负债表中提取关键财务指标",
-            "步骤 2: 计算应收账款周转率",
-            "步骤 3: 与行业基准对比分析"
-        ]
-    )
+    if audit_id not in audits_db:
+        # 返回模拟数据用于开发测试
+        return AuditResult(
+            audit_id=audit_id,
+            document_id="demo_doc",
+            status=TaskStatus.COMPLETED,
+            risk_score=72.0,
+            violations=[
+                ValidationViolation(
+                    rule_id="R001",
+                    rule_name="资产负债表勾稽平衡",
+                    severity=RiskSeverity.CRITICAL,
+                    expected="资产总计 = 负债总计 + 权益总计",
+                    actual="500万 ≠ 495万",
+                    correction_hint="请核验数据提取是否准确"
+                ),
+                ValidationViolation(
+                    rule_id="R012",
+                    rule_name="应收账款周转异常",
+                    severity=RiskSeverity.WARNING,
+                    expected="周转率 > 行业均值",
+                    actual="周转率 = 2.3 (行业均值 = 5.0)",
+                    correction_hint="建议核查应收账款账龄分布"
+                )
+            ],
+            reasoning_chain=[
+                "步骤 1: 从资产负债表中提取关键财务指标",
+                "步骤 2: 执行勾稽平衡检验 (资产 = 负债 + 权益)",
+                "步骤 3: 计算应收账款周转率并与行业基准对比",
+                "步骤 4: 符号引擎校验发现 R001 规则违规",
+                "步骤 5: 生成风险评分和审计建议"
+            ],
+            retry_count=0
+        )
+    
+    return audits_db[audit_id]
+
+
+@router.get("/list")
+async def list_audits(limit: int = 10, offset: int = 0):
+    """
+    获取审计任务列表
+    """
+    audits = list(audits_db.values())
+    return {
+        "total": len(audits),
+        "items": audits[offset:offset + limit]
+    }
