@@ -5,13 +5,13 @@
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api/v1'
 
-interface UploadResponse {
+export interface UploadResponse {
     document_id: string
     filename: string
     status: string
 }
 
-interface AuditResult {
+export interface AuditResult {
     audit_id: string
     status: string
     risk_score: number | null
@@ -23,7 +23,7 @@ interface AuditResult {
     reasoning_chain: string[]
 }
 
-interface QAResponse {
+export interface QAResponse {
     answer: string
     sources: Array<{ title: string; url: string }>
     confidence: number
