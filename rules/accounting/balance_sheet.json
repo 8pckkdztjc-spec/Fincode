@@ -1,0 +1,20 @@
+{
+    "rule_id": "R001",
+    "name": "资产负债表勾稽平衡",
+    "category": "ACCOUNTING",
+    "severity": "CRITICAL",
+    "description": "验证资产负债表基本恒等式：资产总计 = 负债总计 + 所有者权益总计",
+    "expression": {
+        "operator": "equals",
+        "left": "$.assets.total",
+        "right": {
+            "operator": "add",
+            "operands": [
+                "$.liabilities.total",
+                "$.equity.total"
+            ]
+        },
+        "tolerance": 0.01
+    },
+    "correction_hint": "资产总计应等于负债总计与所有者权益总计之和，请核验数据提取是否准确"
+}
