@@ -1,12 +1,14 @@
 """
 审计相关 API 接口
 实现文件上传、审计启动和结果查询
+使用 SQLAlchemy 数据库持久化
 """
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Depends
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional
 from datetime import datetime
+from sqlalchemy.orm import Session
 import uuid
 
 from app.models.schemas import (
@@ -18,49 +20,47 @@ from app.models.schemas import (
     RiskSeverity
 )
 from app.services.storage import file_storage
+from app.services.crud import DocumentCRUD, AuditCRUD
 from app.core.config import settings
+from app.core.database import get_db
 
 router = APIRouter()
-
-# 内存存储（MVP阶段，后续替换为数据库）
-documents_db: Dict[str, dict] = {}
-audits_db: Dict[str, AuditResult] = {}
 
 
 async def parse_document_async(document_id: str, file_path: Path):
     """
     后台异步解析文档任务
-    
-    使用 FastAPI BackgroundTasks 简化异步处理
+
+    注意: BackgroundTask 无法直接使用依赖注入的 db session，需要创建新的 session
     """
+    from app.core.database import SessionLocal
+    db = SessionLocal()
     try:
         # 更新状态为处理中
-        if document_id in documents_db:
-            documents_db[document_id]["status"] = TaskStatus.PROCESSING
-        
+        DocumentCRUD.update(db, document_id, status="processing")
+
         # TODO: 集成 Docling 解析
         # from app.services.document import document_parser
         # parsed_data = await document_parser.parse(file_path)
-        
+
         # 模拟解析完成
-        if document_id in documents_db:
-            documents_db[document_id]["status"] = TaskStatus.COMPLETED
-            documents_db[document_id]["file_path"] = str(file_path)
-            
+        DocumentCRUD.update(db, document_id, status="completed")
+
     except Exception as e:
-        if document_id in documents_db:
-            documents_db[document_id]["status"] = TaskStatus.FAILED
-            documents_db[document_id]["error"] = str(e)
+        DocumentCRUD.update(db, document_id, status="failed", error_message=str(e))
+    finally:
+        db.close()
 
 
 @router.post("/upload", response_model=DocumentUploadResponse)
 async def upload_document(
     file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = None
+    background_tasks: BackgroundTasks = None,
+    db: Session = Depends(get_db)
 ):
     """
     上传财务报表文档
-    
+
     支持 PDF 和 Excel 格式
     使用 UUID + MD5 统一文件命名
     后台异步解析文档
@@ -68,14 +68,14 @@ async def upload_document(
     # 验证文件名
     if not file.filename:
         raise HTTPException(status_code=400, detail="文件名不能为空")
-    
+
     # 验证文件扩展名
     if not file_storage.validate_extension(file.filename):
         raise HTTPException(
             status_code=400,
             detail=f"不支持的文件格式，仅支持: {', '.join(settings.ALLOWED_EXTENSIONS)}"
         )
-    
+
     # 验证文件大小（需要先读取）
     content = await file.read()
     if not file_storage.validate_size(len(content)):
@@ -83,29 +83,23 @@ async def upload_document(
             status_code=400,
             detail=f"文件过大，最大允许 {settings.MAX_FILE_SIZE // 1024 // 1024}MB"
         )
-    
+
     # 重置文件指针
     await file.seek(0)
-    
+
     # 保存文件
     try:
         document_id, storage_path = await file_storage.save_upload(file)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"文件保存失败: {str(e)}")
-    
-    # 记录文档信息
-    documents_db[document_id] = {
-        "document_id": document_id,
-        "filename": file.filename,
-        "status": TaskStatus.PENDING,
-        "file_path": str(storage_path),
-        "created_at": datetime.now()
-    }
-    
+
+    # 创建数据库记录
+    DocumentCRUD.create(db, document_id, file.filename, str(storage_path))
+
     # 添加后台解析任务
     if background_tasks:
         background_tasks.add_task(parse_document_async, document_id, storage_path)
-    
+
     return DocumentUploadResponse(
         document_id=document_id,
         filename=file.filename,
@@ -115,64 +109,74 @@ async def upload_document(
 
 
 @router.get("/document/{document_id}")
-async def get_document_status(document_id: str):
+async def get_document_status(document_id: str, db: Session = Depends(get_db)):
     """
     获取文档解析状态
     """
-    if document_id not in documents_db:
+    doc = DocumentCRUD.get(db, document_id)
+    if not doc:
         raise HTTPException(status_code=404, detail="文档不存在")
-    
-    return documents_db[document_id]
+
+    return {
+        "document_id": doc.id,
+        "filename": doc.filename,
+        "status": doc.status,
+        "file_path": doc.file_path,
+        "created_at": doc.created_at
+    }
 
 
 @router.post("/start", response_model=AuditResult)
 async def start_audit(
     request: AuditStartRequest,
-    background_tasks: BackgroundTasks = None
+    background_tasks: BackgroundTasks = None,
+    db: Session = Depends(get_db)
 ):
     """
     启动审计流程
-    
+
     触发神经-符号双引擎协同审计
     """
     # 验证文档是否存在
-    if request.document_id not in documents_db:
+    doc = DocumentCRUD.get(db, request.document_id)
+    if not doc:
         raise HTTPException(status_code=404, detail="文档不存在")
-    
-    doc = documents_db[request.document_id]
-    
+
     # 验证文档是否已解析完成
-    if doc["status"] != TaskStatus.COMPLETED:
+    if doc.status != "completed":
         raise HTTPException(
             status_code=400,
-            detail=f"文档尚未解析完成，当前状态: {doc['status']}"
+            detail=f"文档尚未解析完成，当前状态: {doc.status}"
         )
-    
+
     # 创建审计任务
     audit_id = str(uuid.uuid4())
-    audit_result = AuditResult(
-        audit_id=audit_id,
-        document_id=request.document_id,
+    AuditCRUD.create(db, audit_id, request.document_id)
+    AuditCRUD.update(db, audit_id, status="processing")
+
+    audit = AuditCRUD.get(db, audit_id)
+
+    # TODO: 添加后台审计任务
+    # background_tasks.add_task(run_audit_async, audit_id, request.document_id)
+
+    return AuditResult(
+        audit_id=audit.id,
+        document_id=audit.document_id,
         status=TaskStatus.PROCESSING,
         risk_score=None
     )
-    
-    audits_db[audit_id] = audit_result
-    
-    # TODO: 添加后台审计任务
-    # background_tasks.add_task(run_audit_async, audit_id, request.document_id)
-    
-    return audit_result
 
 
 @router.get("/result/{audit_id}", response_model=AuditResult)
-async def get_audit_result(audit_id: str):
+async def get_audit_result(audit_id: str, db: Session = Depends(get_db)):
     """
     获取审计结果
-    
+
     返回完整的审计报告，包括风险评分和推理链
     """
-    if audit_id not in audits_db:
+    audit = AuditCRUD.get(db, audit_id)
+
+    if not audit:
         # 返回模拟数据用于开发测试
         return AuditResult(
             audit_id=audit_id,
@@ -206,17 +210,36 @@ async def get_audit_result(audit_id: str):
             ],
             retry_count=0
         )
-    
-    return audits_db[audit_id]
+
+    # 从数据库记录构建返回值
+    return AuditResult(
+        audit_id=audit.id,
+        document_id=audit.document_id,
+        status=TaskStatus(audit.status),
+        risk_score=audit.risk_score,
+        violations=audit.violations or [],
+        reasoning_chain=audit.reasoning_chain or [],
+        retry_count=audit.retry_count
+    )
 
 
 @router.get("/list")
-async def list_audits(limit: int = 10, offset: int = 0):
+async def list_audits(limit: int = 10, offset: int = 0, db: Session = Depends(get_db)):
     """
     获取审计任务列表
     """
-    audits = list(audits_db.values())
+    audits = AuditCRUD.list(db, limit, offset)
+    total = AuditCRUD.count(db)
     return {
-        "total": len(audits),
-        "items": audits[offset:offset + limit]
+        "total": total,
+        "items": [
+            {
+                "audit_id": a.id,
+                "document_id": a.document_id,
+                "status": a.status,
+                "risk_score": a.risk_score,
+                "created_at": a.created_at
+            }
+            for a in audits
+        ]
     }

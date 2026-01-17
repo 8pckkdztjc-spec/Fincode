@@ -7,6 +7,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import audit, qa, report
+from app.core.database import engine
+from app.models.database import Base
+
+# 创建数据库表（如果不存在）
+Base.metadata.create_all(bind=engine)
 
 # 创建 FastAPI 应用实例
 app = FastAPI(
